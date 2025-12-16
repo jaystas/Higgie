@@ -21,6 +21,7 @@ from ..model.higgs_audio import HiggsAudioModel
 from ..model.higgs_audio.utils import revert_delay_pattern
 from ..data_collator.higgs_audio_collator import HiggsAudioSampleCollator
 from ..audio_processing.higgs_audio_tokenizer import load_higgs_audio_tokenizer
+from .voice_profile_session import VoiceProfileSession, VoiceProfileConfig
 
 
 @dataclass
@@ -489,3 +490,271 @@ class HiggsAudioServeEngine:
 
             async for delta in streamer:
                 yield delta
+
+    def _prepare_inputs_with_context(
+        self,
+        chat_ml_sample: ChatMLSample,
+        context_audio_ids: List[torch.Tensor],
+        force_audio_gen: bool = False,
+    ):
+        """
+        Prepare inputs with accumulated audio context for voice consistency.
+
+        This method is similar to _prepare_inputs but handles multiple audio contexts
+        from previous generations, enabling voice-consistent streaming.
+
+        Args:
+            chat_ml_sample: The ChatML sample containing messages with voice profile.
+            context_audio_ids: List of audio token tensors from previous generations.
+                Each tensor has shape (num_codebooks, seq_len).
+            force_audio_gen: Whether to force audio generation by adding audio_out_bos token.
+
+        Returns:
+            Dictionary of model inputs ready for generation.
+        """
+        input_tokens, _, audio_contents, _ = prepare_chatml_sample(
+            chat_ml_sample,
+            self.tokenizer,
+        )
+
+        postfix = "<|start_header_id|>assistant<|end_header_id|>\n\n"
+        if force_audio_gen:
+            postfix += "<|audio_out_bos|>"
+        postfix = self.tokenizer.encode(postfix, add_special_tokens=False)
+        input_tokens.extend(postfix)
+
+        # Process audio contents from chat (voice clone references if any)
+        audio_ids_l = []
+        for audio_content in audio_contents:
+            if audio_content.audio_url not in ["placeholder", ""]:
+                raw_audio, _ = librosa.load(audio_content.audio_url, sr=self.audio_tokenizer.sampling_rate)
+            elif audio_content.raw_audio is not None:
+                raw_audio, _ = librosa.load(
+                    BytesIO(base64.b64decode(audio_content.raw_audio)),
+                    sr=self.audio_tokenizer.sampling_rate
+                )
+            else:
+                raw_audio = None
+
+            if raw_audio is not None:
+                audio_ids = self.audio_tokenizer.encode(raw_audio, self.audio_tokenizer.sampling_rate)
+                audio_ids_l.append(audio_ids.squeeze(0).cpu())
+
+        # Add accumulated context audio IDs from previous generations
+        for ctx_audio_ids in context_audio_ids:
+            audio_ids_l.append(ctx_audio_ids.cpu() if ctx_audio_ids.is_cuda else ctx_audio_ids)
+
+        if len(audio_ids_l) > 0:
+            audio_ids_start = torch.tensor(
+                np.cumsum(np.array([0] + [audio_ids.shape[1] for audio_ids in audio_ids_l])),
+                dtype=torch.long,
+                device=self.device,
+            )[0:-1]
+            audio_ids_concat = torch.cat(audio_ids_l, dim=1)
+        else:
+            audio_ids_start = None
+            audio_ids_concat = None
+
+        sample = ChatMLDatasetSample(
+            input_ids=torch.LongTensor(input_tokens),
+            label_ids=None,
+            audio_ids_concat=audio_ids_concat,
+            audio_ids_start=audio_ids_start,
+            audio_waveforms_concat=None,
+            audio_waveforms_start=None,
+            audio_sample_rate=None,
+            audio_speaker_indices=None,
+        )
+        data = self.collator([sample])
+        inputs = asdict(data)
+        for k, v in inputs.items():
+            if isinstance(v, torch.Tensor):
+                inputs[k] = v.to(self.model.device)
+
+        return inputs
+
+    async def generate_delta_stream_with_voice_profile(
+        self,
+        text: str,
+        session: VoiceProfileSession,
+        max_new_tokens: int = 2048,
+        temperature: float = 0.7,
+        top_k: Optional[int] = None,
+        top_p: float = 0.95,
+        stop_strings: Optional[List[str]] = None,
+        force_audio_gen: bool = True,
+        ras_win_len: Optional[int] = 7,
+        ras_win_max_num_repeat: int = 2,
+        seed: Optional[int] = None,
+    ):
+        """
+        Stream audio generation with voice consistency using text profiles.
+
+        This method maintains voice consistency across multiple generations by:
+        1. Using the session's accumulated audio tokens as context
+        2. Building on previous generation messages
+        3. Collecting generated tokens to add to context for next generation
+
+        The voice profile is defined via text descriptions (speaker_desc + scene_prompt)
+        rather than audio cloning, and consistency is achieved by providing previous
+        generation audio as context.
+
+        Args:
+            text: The text to synthesize into speech.
+            session: VoiceProfileSession managing voice consistency state.
+                Created via create_voice_profile_session().
+            max_new_tokens: Maximum tokens to generate (default: 2048).
+            temperature: Sampling temperature (default: 0.7).
+            top_k: Top-k sampling parameter (default: None).
+            top_p: Top-p (nucleus) sampling parameter (default: 0.95).
+            stop_strings: Strings that stop generation (default: ["<|end_of_text|>", "<|eot_id|>"]).
+            force_audio_gen: Force audio token generation (default: True).
+            ras_win_len: RAS window length for reducing repetition (default: 7).
+            ras_win_max_num_repeat: Max repeats in RAS window (default: 2).
+            seed: Random seed for reproducibility (default: None).
+
+        Yields:
+            HiggsAudioStreamerDelta objects containing text and/or audio tokens.
+
+        Example:
+            >>> session = engine.create_voice_profile_session(
+            ...     speaker_desc="Female, British accent, calm tone",
+            ...     scene_prompt="Quiet studio"
+            ... )
+            >>> async for delta in engine.generate_delta_stream_with_voice_profile(
+            ...     "Hello, welcome!", session
+            ... ):
+            ...     if delta.audio_tokens is not None:
+            ...         process_audio(delta.audio_tokens)
+        """
+        if stop_strings is None:
+            stop_strings = ["<|end_of_text|>", "<|eot_id|>"]
+        if ras_win_len is not None and ras_win_len <= 0:
+            ras_win_len = None
+
+        # Add user message to session
+        session.add_user_message(text)
+
+        # Build ChatML sample with accumulated context
+        chat_ml_sample = ChatMLSample(messages=session.get_context_messages())
+
+        # Get context audio IDs from previous generations
+        context_audio_ids = session.get_context_audio_ids()
+
+        with torch.no_grad():
+            # Prepare inputs with context
+            inputs = self._prepare_inputs_with_context(
+                chat_ml_sample,
+                context_audio_ids,
+                force_audio_gen=force_audio_gen
+            )
+
+            self._prepare_kv_caches()
+
+            # Create streamer for async iteration
+            streamer = AsyncHiggsAudioStreamer(
+                self.tokenizer,
+                audio_num_codebooks=self.model.config.audio_num_codebooks,
+                skip_prompt=True,
+            )
+
+            # Collect audio tokens during streaming for context accumulation
+            collected_audio_tokens = []
+
+            generation_kwargs = dict(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                use_cache=True,
+                stop_strings=stop_strings,
+                tokenizer=self.tokenizer,
+                do_sample=False if temperature == 0.0 else True,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                past_key_values_buckets=self.kv_caches,
+                ras_win_len=ras_win_len,
+                ras_win_max_num_repeat=ras_win_max_num_repeat,
+                seed=seed,
+                streamer=streamer,
+            )
+
+            thread = threading.Thread(target=self.model.generate, kwargs=generation_kwargs)
+            thread.start()
+
+            async for delta in streamer:
+                # Collect audio tokens for session context
+                if delta.audio_tokens is not None:
+                    collected_audio_tokens.append(delta.audio_tokens)
+
+                yield delta
+
+            # Wait for generation thread to complete
+            thread.join()
+
+            # Process collected audio tokens and add to session context
+            if collected_audio_tokens:
+                # Stack audio tokens: each is shape (num_codebooks,), stack to (num_codebooks, seq_len)
+                audio_tokens_tensor = torch.stack(collected_audio_tokens, dim=1)
+
+                # Revert delay pattern and clip to valid range
+                processed_audio = revert_delay_pattern(audio_tokens_tensor)
+                processed_audio = processed_audio.clip(0, self.audio_codebook_size - 1)[:, 1:-1]
+
+                # Add to session context for voice consistency in subsequent generations
+                session.add_generated_audio(processed_audio)
+
+    def create_voice_profile_session(
+        self,
+        speaker_desc: str,
+        scene_prompt: Optional[str] = None,
+        generation_chunk_buffer_size: Optional[int] = 2,
+    ) -> VoiceProfileSession:
+        """
+        Create a new voice profile session for consistent voice streaming.
+
+        This factory method creates a VoiceProfileSession configured with the
+        specified voice characteristics. The session can then be used with
+        generate_delta_stream_with_voice_profile() to maintain voice consistency
+        across multiple generation calls.
+
+        Args:
+            speaker_desc: Description of the speaker/voice characteristics.
+                Examples:
+                - "Male, American accent, moderate pitch, friendly tone, very clear audio"
+                - "Female, British accent, calm and professional tone, moderate pace"
+                - "Young adult, energetic, slightly fast speaking rate"
+            scene_prompt: Description of the audio environment (optional).
+                Examples:
+                - "Audio is recorded from a quiet room."
+                - "Professional podcast recording studio"
+                - "Outdoor setting with minimal background noise"
+            generation_chunk_buffer_size: Number of past generations to keep as context.
+                - None: Keep all generations (caution: may cause context overflow)
+                - 2 (default): Keep last 2 generations - recommended balance
+                - Higher values: More context, potentially better consistency but slower
+
+        Returns:
+            VoiceProfileSession configured for consistent voice generation.
+
+        Example:
+            >>> # Create a session with British female voice
+            >>> session = engine.create_voice_profile_session(
+            ...     speaker_desc="Female, British accent, calm tone, clear articulation",
+            ...     scene_prompt="Professional podcast recording studio",
+            ...     generation_chunk_buffer_size=2
+            ... )
+            >>>
+            >>> # Generate multiple audio segments with consistent voice
+            >>> texts = ["Hello!", "How are you?", "Goodbye!"]
+            >>> for text in texts:
+            ...     async for delta in engine.generate_delta_stream_with_voice_profile(
+            ...         text, session
+            ...     ):
+            ...         process_audio(delta)
+        """
+        config = VoiceProfileConfig(
+            speaker_desc=speaker_desc,
+            scene_prompt=scene_prompt,
+            generation_chunk_buffer_size=generation_chunk_buffer_size,
+        )
+        return VoiceProfileSession(config=config)
