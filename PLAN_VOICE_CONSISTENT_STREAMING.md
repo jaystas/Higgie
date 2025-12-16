@@ -92,7 +92,7 @@ class VoiceProfileConfig:
     """Configuration for a voice profile session."""
     speaker_desc: str  # e.g., "Male, American accent, moderate pitch, friendly tone"
     scene_prompt: Optional[str] = None  # e.g., "Audio is recorded from a quiet room."
-    generation_chunk_buffer_size: Optional[int] = 3  # Number of past generations to keep as context
+    generation_chunk_buffer_size: Optional[int] = 2  # Number of past generations to keep as context
 
 
 @dataclass
@@ -386,7 +386,7 @@ class HiggsAudioServeEngine:
         self,
         speaker_desc: str,
         scene_prompt: Optional[str] = None,
-        generation_chunk_buffer_size: Optional[int] = 3,
+        generation_chunk_buffer_size: Optional[int] = 2,
     ) -> VoiceProfileSession:
         """
         Create a new voice profile session for consistent voice streaming.
@@ -406,7 +406,7 @@ class HiggsAudioServeEngine:
             >>> session = engine.create_voice_profile_session(
             ...     speaker_desc="Female, British accent, calm tone, clear articulation",
             ...     scene_prompt="Professional podcast recording studio",
-            ...     generation_chunk_buffer_size=3
+            ...     generation_chunk_buffer_size=2
             ... )
             >>> async for delta in engine.generate_delta_stream_with_voice_profile(
             ...     "Hello, welcome to the show!",
@@ -486,7 +486,7 @@ async def main():
     session = engine.create_voice_profile_session(
         speaker_desc="Female, British accent, calm and professional tone, moderate pace, very clear audio",
         scene_prompt="Audio is recorded from a quiet podcast studio.",
-        generation_chunk_buffer_size=3,  # Keep last 3 generations as context
+        generation_chunk_buffer_size=2,  # Keep last 2 generations as context
     )
 
     # Text chunks to synthesize
@@ -562,7 +562,7 @@ The `generation_chunk_buffer_size` parameter controls context accumulation:
 
 - `None`: Keep ALL previous generations (may cause context overflow)
 - `1`: Only use immediately previous generation as context
-- `3` (recommended): Keep last 3 generations for good balance
+- `2` (recommended): Keep last 2 generations for good balance
 - Higher values: More consistent voice but larger context/slower generation
 
 ### Audio Token Processing
@@ -620,7 +620,7 @@ processed_audio = processed_audio[:, 1:-1]
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
-| Context overflow with large buffers | OOM errors | Use reasonable buffer size (3-5), monitor memory |
+| Context overflow with large buffers | OOM errors | Use reasonable buffer size (2-4), monitor memory |
 | Audio quality degradation with buffer | Poor output | Test optimal buffer sizes, allow configuration |
 | Thread safety in async streaming | Race conditions | Use proper synchronization for audio collection |
 | Session state corruption | Inconsistent voice | Immutable config, clear state management |
